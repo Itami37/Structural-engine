@@ -1,0 +1,7 @@
+numpy>=1.24
+PySide6>=6.5
+vtk>=9.2
+matplotlib>=3.7
+# openseespy is platform-specific; install manually (see README)
+# pythonocc-core is distributed via conda-forge only:
+#   conda install -c conda-forge pythonocc-core

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.vscode/
+.idea/
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+*.log
+check_transf.py
+check_occ.py
