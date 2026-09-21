@@ -1,12 +1,12 @@
-"""python -m structural_engine -- tries GUI, falls back to headless demo."""
+"""Entry point — GUI or headless demo."""
 from __future__ import annotations
 import sys
 
 
 def main():
     try:
-        from PySide6 import QtWidgets          # noqa: F401
-        from vtkmodules.qt.QVTKRenderWindowInteractor import (  # noqa: F401
+        from PySide6 import QtWidgets  # noqa
+        from vtkmodules.qt.QVTKRenderWindowInteractor import (  # noqa
             QVTKRenderWindowInteractor)
         from . import geometry as geom
         if not geom.has_occ():
@@ -21,49 +21,36 @@ def main():
 
 def _headless_demo():
     from .materials import Concrete, Steel
-    from .rebar import (RebarLayout, longitudinal_bar_positions,
-                        stirrup_positions)
-    from .section import FiberSection
-    from .components import Column, Beam
+    from .profiles import rectangle
+    from .rebar import RebarLayout
+    from .templates import ComponentTemplate, COLUMN, BEAM
+    from .components import Node, Member
     from .model import Model
-    from .solver import solve, fiber_stresses_from_section_forces
+    from .solver import solve, _find_dangling_anchors
 
     C = Concrete("C30", fc=30e6, Ec=30e9)
     S = Steel("Fe500", fy=500e6, Es=200e9)
-    R = RebarLayout(cover=0.04, db=0.020, ds=0.010,
-                    n_bars_x=3, n_bars_y=3, stirrup_spacing=0.15)
+    R = RebarLayout(0.04, 0.020, 0.010, 3, 3, 0.15)
 
-    bars = longitudinal_bar_positions(0.4, 0.4, R)
-    print(f"Longitudinal bars ({len(bars)}):")
-    for (y, z) in bars:
-        print(f"  y={y:+.4f}  z={z:+.4f}")
+    m = Model()
+    m.add_template(ComponentTemplate("Col", COLUMN, rectangle(0.3, 0.3), C, S, R))
+    m.add_template(ComponentTemplate("Bm", BEAM, rectangle(0.3, 0.5), C, S, R))
 
-    st = stirrup_positions(3.0, 0.15, 0.05)
-    print(f"Stirrups (L=3.0, s=0.15): {len(st)} positions, "
-          f"first={st[0]:.4f}, last={st[-1]:.4f}")
+    m.add_node(Node("N1", 0, 0, 0))
+    m.add_node(Node("N2", 0, 0, 3.0))
+    m.add_node(Node("N3", 0, 5.0, 0))
+    m.add_node(Node("N4", 0, 5.0, 3.0))
+    m.recompute_geometry()
 
-    model = Model()
-    c1 = model.add_column(Column("C1", x=0.0, y=0.0, z=0.0,
-                                 concrete=C, steel=S, rebar=R))
-    c2 = model.add_column(Column("C2", x=4.0, y=0.0, z=0.0,
-                                 concrete=C, steel=S, rebar=R))
-    b1 = model.add_beam(Beam("B1", c1, c2, concrete=C, steel=S, rebar=R))
-    print(f"\nBeam length before move : {b1.length.value:.4f} m")
+    m.add_member(Member("C1", m.templates.get("Col"), "N1", "N2"))
+    m.add_member(Member("C2", m.templates.get("Col"), "N3", "N4"))
+    m.add_member(Member("B1", m.templates.get("Bm"), "N2", "N4"))
+    m.add_point_load("N4", (0.0, 0.0, -10e3, 0.0, 0.0, 0.0))
+    m.add_member_udl("B1", "z", -5e3)
 
-    c2.px.value = 6.0
-    print(f"Beam length after C2.x=6 : {b1.length.value:.4f} m")
-
-    sec = FiberSection(0.4, 0.4, R)
-    stresses, fibs = fiber_stresses_from_section_forces(
-        sec, C.Ec, S.Es, N=0.0, My=0.0, Mz=100e3)
-    c_s = [s for s, f in zip(stresses, fibs) if f.material == "concrete"]
-    s_s = [s for s, f in zip(stresses, fibs) if f.material == "steel"]
-    print(f"\nSection reconstruction: {len(fibs)} fibers, "
-          f"max|sigma_c| = {max(abs(s) for s in c_s)/1e6:.3f} MPa, "
-          f"max|sigma_s| = {max(abs(s) for s in s_s)/1e6:.3f} MPa")
-
-    res = solve(model)
-    print(f"\nsolve(): used_opensees={res.used_opensees}  {res.message}")
+    print("Dangling nodes:", _find_dangling_anchors(m))
+    res = solve(m)
+    print(f"solve(): used_opensees={res.used_opensees}  {res.message}")
 
 
 if __name__ == "__main__":

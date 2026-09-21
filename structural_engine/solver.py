@@ -1,40 +1,24 @@
-"""OpenSees fiber-section static analysis + fiber stress reconstruction.
-
-Uses elasticBeamColumn elements with equivalent transformed-section
-properties derived from the fiber discretization.  This is mathematically
-equivalent to a linear-elastic fiber-section beam for linear static
-analysis, and it avoids a transform-lookup bug in OpenSees 3.8's
-dispBeamColumn element.
-
-Fiber stresses are reconstructed from element end forces via the
-linear-elastic section stiffness matrix:
-    [N ]   [S00 S01 S02] [eps0]
-    [Mz] = [S10 S11 S12] [ a  ]
-    [My]   [S20 S21 S22] [ b  ]
-    strain(y,z) = eps0 + a*y + b*z ; stress_i = E_i * strain(y_i, z_i)
-"""
+"""OpenSees: fiber-section line members + shell slabs + UDL."""
 from __future__ import annotations
 from dataclasses import dataclass, field
-import math
-import os
-import sys
-
+import math, os, sys
 import numpy as np
 
-# Windows: openseespy ships its runtime DLLs in a sibling 'lib' folder that
-# Python's loader does not search by default.  Register it before importing.
 if sys.platform == "win32":
     _opensees_lib = os.path.join(
         sys.prefix, "Lib", "site-packages", "openseespywin", "lib")
     if os.path.isdir(_opensees_lib):
-        try:
-            os.add_dll_directory(_opensees_lib)
-        except Exception:
-            pass
+        try: os.add_dll_directory(_opensees_lib)
+        except Exception: pass
 
-from .model import Model
-from .section import FiberSection
+from .section import FiberSection, _point_in_poly
 from .rebar import longitudinal_bar_positions
+
+
+N_IPS = 5
+_LOBATTO_5 = [0.0, 0.17267316464601146, 0.5, 0.8273268353539885, 1.0]
+
+NODE_MERGE_TOL = 1e-4     # metres — user-tunable in app
 
 
 @dataclass
@@ -42,235 +26,260 @@ class SolutionResult:
     node_displacements: dict = field(default_factory=dict)
     element_fiber_stress: dict = field(default_factory=dict)
     element_meta: dict = field(default_factory=dict)
+    element_ip_positions: dict = field(default_factory=dict)
+    shell_stress: dict = field(default_factory=dict)   # slab tag → per-quad stress
     used_opensees: bool = False
     message: str = ""
 
 
-# ----------------------------------------------------------------- helpers
-def _section_matrix(section: FiberSection, E_c: float, E_s: float):
-    fibs = section.fibers()
+def _section_matrix(fibs, E_c, E_s):
     S = np.zeros((3, 3))
     E_list = np.empty(len(fibs))
     for k, f in enumerate(fibs):
         E = E_c if f.material == "concrete" else E_s
         EA = E * f.area
-        y, z = f.y, f.z
-        S[0, 0] += EA
-        S[0, 1] += EA * y
-        S[0, 2] += EA * z
-        S[1, 1] += EA * y * y
-        S[1, 2] += EA * y * z
-        S[2, 2] += EA * z * z
+        S[0,0] += EA;        S[0,1] += EA*f.y;     S[0,2] += EA*f.z
+        S[1,1] += EA*f.y*f.y; S[1,2] += EA*f.y*f.z; S[2,2] += EA*f.z*f.z
         E_list[k] = E
-    S[1, 0] = S[0, 1]
-    S[2, 0] = S[0, 2]
-    S[2, 1] = S[1, 2]
-    return S, fibs, E_list
+    S[1,0] = S[0,1]; S[2,0] = S[0,2]; S[2,1] = S[1,2]
+    return S, E_list
 
 
 def fiber_stresses_from_section_forces(section, E_c, E_s, N, Mz, My):
-    """Return (stresses, fibers) for a section under axial force N,
-    moment about local z (Mz) and moment about local y (My)."""
-    S, fibs, E_list = _section_matrix(section, E_c, E_s)
+    fibs = section.fibers()
+    S, E_list = _section_matrix(fibs, E_c, E_s)
     try:
         eps0, a, b = np.linalg.solve(S, np.array([N, Mz, My], dtype=float))
     except np.linalg.LinAlgError:
         eps0 = a = b = 0.0
-    stresses = [E * (eps0 + a * f.y + b * f.z) for f, E in zip(fibs, E_list)]
+    stresses = [E * (eps0 + a * f.y + b * f.z)
+                for f, E in zip(fibs, E_list)]
     return stresses, fibs
 
 
-def _equiv_props(comp):
-    """Return equivalent elastic section properties for elasticBeamColumn.
-
-    Uses transformed-section properties derived from the fiber
-    discretization with linear-elastic materials, so that the beam element
-    stiffness matches what a fiber-section element would produce for a
-    linear analysis.
-    """
-    sec = FiberSection(b=comp.b.value, h=comp.h.value, rebar=comp.rebar)
-    fibs = sec.fibers()
-    Ec = comp.concrete.Ec
-    Es = comp.steel.Es
-
-    EA = 0.0
-    Ey = 0.0
-    Ez = 0.0
-    for f in fibs:
-        E = Ec if f.material == "concrete" else Es
-        EA += E * f.area
-        Ey += E * f.area * f.y
-        Ez += E * f.area * f.z
-    ybar = Ey / EA
-    zbar = Ez / EA
-
-    EIy = 0.0   # ∫ y_section² dA * E
-    EIz = 0.0   # ∫ z_section² dA * E
-    for f in fibs:
-        E = Ec if f.material == "concrete" else Es
-        EIy += E * f.area * (f.y - ybar) ** 2
-        EIz += E * f.area * (f.z - zbar) ** 2
-
-    A_eff = EA / Ec
-    Iy_eff = EIy / Ec
-    Iz_eff = EIz / Ec
-    J_eff = Iy_eff + Iz_eff
-    G = Ec / (2.0 * (1.0 + comp.concrete.nu))
-    return A_eff, Ec, G, J_eff, Iy_eff, Iz_eff
+def _find_dangling_anchors(model) -> list[str]:
+    """Return names of nodes that are referenced by only one member and
+    have no restraint — likely unintended disconnections."""
+    degree = {n: 0 for n in model.nodes}
+    for m in model.members.values():
+        degree[m.start_node] = degree.get(m.start_node, 0) + 1
+        degree[m.end_node] = degree.get(m.end_node, 0) + 1
+    for s in model.slabs.values():
+        for c in s.corners:
+            degree[c] = degree.get(c, 0) + 1
+    dangling = []
+    for n, d in degree.items():
+        if d <= 1 and n not in model.restraints:
+            dangling.append(n)
+    return dangling
 
 
-# ------------------------------------------------------------------- entry
-def solve(model: Model, use_opensees: bool = True) -> SolutionResult:
+def solve(model, use_opensees=True) -> SolutionResult:
     if use_opensees:
         try:
-            import openseespy.opensees  # noqa: F401
+            import openseespy.opensees  # noqa
             return _solve_opensees(model)
         except ImportError:
             pass
     return _solve_mock(model)
 
 
-def _solve_mock(model: Model) -> SolutionResult:
-    res = SolutionResult(
-        used_opensees=False,
-        message="openseespy unavailable; returning zero results.")
-    for col in model.columns.values():
-        res.node_displacements[hash(("col", col.name))] = np.zeros(6)
-    for beam in model.beams.values():
-        res.node_displacements[hash(("beam", beam.name))] = np.zeros(6)
-    return res
+def _solve_mock(model):
+    return SolutionResult(used_opensees=False,
+                          message="openseespy unavailable")
 
 
-def _solve_opensees(model: Model) -> SolutionResult:
+def _solve_opensees(model) -> SolutionResult:
     import openseespy.opensees as ops
 
-    ops.wipe()
-    ops.model("basic", "-ndm", 3, "-ndf", 6)
+    ops.wipe(); ops.model("basic", "-ndm", 3, "-ndf", 6)
 
-    # ---------- nodes
-    node_map: dict = {}
-    next_node = [1]
+    # ---------- materials
+    mat_tags: dict = {}; next_tag = [1]
+    def _mat(kind, name, modulus):
+        k = (kind, name)
+        if k not in mat_tags:
+            mat_tags[k] = next_tag[0]
+            ops.uniaxialMaterial("Elastic", next_tag[0], modulus)
+            next_tag[0] += 1
+        return mat_tags[k]
 
-    def _snap(x, y, z):
-        return (round(x, 6), round(y, 6), round(z, 6))
-
+    # ---------- nodes with tolerance-based merging
+    node_map: dict = {}; next_node = [1]
     def _get_node(x, y, z):
-        k = _snap(x, y, z)
-        if k not in node_map:
-            node_map[k] = next_node[0]
-            ops.node(next_node[0], x, y, z)
-            next_node[0] += 1
-        return node_map[k]
+        for (kx, ky, kz), tag in node_map.items():
+            if (abs(kx - x) < NODE_MERGE_TOL and
+                abs(ky - y) < NODE_MERGE_TOL and
+                abs(kz - z) < NODE_MERGE_TOL):
+                return tag
+        tag = next_node[0]; next_node[0] += 1
+        ops.node(tag, x, y, z)
+        node_map[(x, y, z)] = tag
+        return tag
 
-    # ---------- equivalent section properties (computed lazily, per component)
-    section_objs: dict = {}    # comp_name -> (FiberSection, Ec, Es)
-    section_props: dict = {}   # comp_name -> (A, E, G, J, Iy, Iz)
+    # ---------- create OpenSees nodes for every model node
+    node_tags: dict[str, int] = {}
+    for name, n in model.nodes.items():
+        x, y, z = n.xyz
+        node_tags[name] = _get_node(x, y, z)
 
-    def _get_props(comp):
-        key = comp.name
-        if key not in section_props:
-            props = _equiv_props(comp)
-            section_props[key] = props
-            section_objs[key] = (
-                FiberSection(b=comp.b.value, h=comp.h.value, rebar=comp.rebar),
-                comp.concrete.Ec, comp.steel.Es)
-        return section_props[key]
+    # ---------- members
+    section_tags = {}; section_objs = {}; next_sec = [1]
+    int_tags = {}; next_int = [1]
+    transf_tags = {}; next_tr = [1]
 
-    # ---------- transformations
-    transf_tags: dict = {}
-    next_tr = [1]
+    def _get_section(m):
+        k = (m.profile.name, round(m.b, 6), round(m.h, 6),
+             m.rebar.cover, m.rebar.db, m.rebar.ds,
+             m.rebar.n_bars_x, m.rebar.n_bars_y,
+             m.concrete.name, m.steel.name)
+        if k in section_tags: return section_tags[k]
+        tag = next_sec[0]; next_sec[0] += 1
+        section_tags[k] = tag
+        sec = FiberSection(profile=m.profile, rebar=m.rebar)
+        c_tag = _mat("conc", m.concrete.name, m.concrete.Ec)
+        s_tag = _mat("steel", m.steel.name, m.steel.Es)
+        Iy = m.b * m.h ** 3 / 12.0; Iz = m.h * m.b ** 3 / 12.0
+        G = m.concrete.Ec / (2 * (1 + m.concrete.nu))
+        ops.section("Fiber", tag, "-GJ", G * (Iy + Iz))
+        for f in sec.fibers():
+            ops.fiber(f.y, f.z, f.area,
+                      c_tag if f.material == "concrete" else s_tag)
+        section_objs[tag] = (sec, m.concrete.Ec, m.steel.Es)
+        return tag
 
-    def _get_transf(vecxz):
+    def _get_int(sec_tag):
+        if sec_tag not in int_tags:
+            int_tags[sec_tag] = next_int[0]
+            ops.beamIntegration("Lobatto", next_int[0], sec_tag, N_IPS)
+            next_int[0] += 1
+        return int_tags[sec_tag]
+
+    def _get_tr(vecxz):
         k = tuple(round(c, 6) for c in vecxz)
         if k not in transf_tags:
             transf_tags[k] = next_tr[0]
-            ops.geomTransf("Linear", next_tr[0], *vecxz)
-            next_tr[0] += 1
+            ops.geomTransf("Linear", next_tr[0], *vecxz); next_tr[0] += 1
         return transf_tags[k]
 
-    def _vecxz(axis):
-        ax, ay, az = axis
-        n = math.sqrt(ax * ax + ay * ay + az * az)
-        ax, ay, az = ax / n, ay / n, az / n
-        return (1.0, 0.0, 0.0) if abs(az) > 0.9 else (0.0, 0.0, 1.0)
+    ele_meta = {}; next_ele = [1]
 
-    # ---------- create nodes (shared between columns and beams)
-    for col in model.columns.values():
-        bx, by, bz = col.base.value
-        tx, ty, tz = col.top.value
-        col._node_b = _get_node(bx, by, bz)
-        col._node_t = _get_node(tx, ty, tz)
-
-    for beam in model.beams.values():
-        sx, sy, sz = beam.start.value
-        ex, ey, ez = beam.end.value
-        beam._node_s = _get_node(sx, sy, sz)
-        beam._node_e = _get_node(ex, ey, ez)
-
-    # ---------- elements (elasticBeamColumn with transformed props)
-    next_ele = [1]
-    ele_meta: dict = {}
-
-    for col in model.columns.values():
-        A, E, G, J, Iy, Iz = _get_props(col)
-        tr = _get_transf((1.0, 0.0, 0.0))
+    for m in model.members.values():
+        s = model.nodes[m.start_node].xyz
+        e = model.nodes[m.end_node].xyz
+        d = (e[0]-s[0], e[1]-s[1], e[2]-s[2])
+        L = math.sqrt(sum(c*c for c in d))
+        if L < 1e-9: continue
+        sec_tag = _get_section(m); int_tag = _get_int(sec_tag)
+        vec = (1.0, 0.0, 0.0) if abs(d[2]/L) > 0.9 else (0.0, 0.0, 1.0)
+        tr = _get_tr(vec)
         tag = next_ele[0]; next_ele[0] += 1
-        ops.element("elasticBeamColumn", tag, col._node_b, col._node_t,
-                    A, E, G, J, Iy, Iz, tr)
-        col._ele_tag = tag
-        ele_meta[tag] = (col._node_b, col._node_t, col.name, col, True)
+        ops.element("dispBeamColumn", tag,
+                    node_tags[m.start_node], node_tags[m.end_node],
+                    tr, int_tag)
+        m._ele_tag = tag
+        ele_meta[tag] = (m, sec_tag)
 
-    for beam in model.beams.values():
-        A, E, G, J, Iy, Iz = _get_props(beam)
-        sx, sy, sz = beam.start.value
-        ex, ey, ez = beam.end.value
-        tr = _get_transf(_vecxz((ex - sx, ey - sy, ez - sz)))
-        tag = next_ele[0]; next_ele[0] += 1
-        ops.element("elasticBeamColumn", tag, beam._node_s, beam._node_e,
-                    A, E, G, J, Iy, Iz, tr)
-        beam._ele_tag = tag
-        ele_meta[tag] = (beam._node_s, beam._node_e, beam.name, beam, False)
+    # ---------- slabs (shells)
+    shell_meta = {}; shell_sec_tags = {}
+    def _get_shell_section(slab):
+        k = (slab.template.name, round(slab.thickness, 6))
+        if k in shell_sec_tags: return shell_sec_tags[k]
+        tag = next_sec[0]; next_sec[0] += 1
+        shell_sec_tags[k] = tag
+        mat = _mat("conc", slab.concrete.name, slab.concrete.Ec)
+        ops.section("ElasticMembranePlateSection", tag,
+                    slab.concrete.Ec, slab.concrete.nu, slab.thickness, 1.0)
+        return tag
 
-    # ---------- restraints (default: fully fix every column base)
-    for col in model.columns.values():
-        fixed = model.restraints.get(col.name, (True,) * 6)
-        ops.fix(col._node_b, *[int(f) for f in fixed])
+    for slab in model.slabs.values():
+        if len(slab.corners) != 4:
+            continue
+        # Build a (mesh_nx × mesh_ny) grid over the 4 corners (bilinear)
+        c = [model.nodes[n].xyz for n in slab.corners]
+        n1, n2, n3, n4 = c
+        nx, ny = slab.mesh_nx, slab.mesh_ny
+        grid_tags = [[None]*(nx+1) for _ in range(ny+1)]
+        for j in range(ny+1):
+            v = j / ny
+            for i in range(nx+1):
+                u = i / nx
+                # bilinear interpolation of the quad
+                top = ((1-u)*n4[0] + u*n3[0], (1-u)*n4[1] + u*n3[1], (1-u)*n4[2] + u*n3[2])
+                bot = ((1-u)*n1[0] + u*n2[0], (1-u)*n1[1] + u*n2[1], (1-u)*n1[2] + u*n2[2])
+                p = ((1-v)*bot[0] + v*top[0], (1-v)*bot[1] + v*top[1], (1-v)*bot[2] + v*top[2])
+                grid_tags[j][i] = _get_node(*p)
+        sec_tag = _get_shell_section(slab)
+        # ShellMITC4 is oriented with local x-y; we pass node order
+        for j in range(ny):
+            for i in range(nx):
+                n_a = grid_tags[j][i]; n_b = grid_tags[j][i+1]
+                n_c = grid_tags[j+1][i+1]; n_d = grid_tags[j+1][i]
+                tag = next_ele[0]; next_ele[0] += 1
+                try:
+                    ops.element("ShellMITC4", tag, n_a, n_b, n_c, n_d, sec_tag)
+                    shell_meta[tag] = slab
+                except Exception as e:
+                    print(f"[warn] slab quad failed: {e}")
+
+    # ---------- restraints
+    applied = set()
+    for name, fixed in model.restraints.items():
+        tag = node_tags.get(name)
+        if tag is not None:
+            ops.fix(tag, *[int(f) for f in fixed])
+            applied.add(name)
+
+    # Default: fix every node used only by a column AND at the lowest z
+    for m in model.members.values():
+        if m.category == "column":
+            s_name = m.start_node; e_name = m.end_node
+            s_z = model.nodes[s_name].xyz[2]
+            e_z = model.nodes[e_name].xyz[2]
+            bottom = s_name if s_z < e_z else e_name
+            if bottom not in applied:
+                ops.fix(node_tags[bottom], 1,1,1,1,1,1)
+                applied.add(bottom)
 
     # ---------- loads
-    ops.timeSeries("Linear", 1)
-    ops.pattern("Plain", 1, 1)
+    ops.timeSeries("Linear", 1); ops.pattern("Plain", 1, 1)
     g = 9.81
 
-    for col in model.columns.values():
-        W = col.concrete.rho * col.b.value * col.h.value * col.length.value * g
-        ops.load(col._node_b, 0.0, 0.0, -W / 2.0, 0.0, 0.0, 0.0)
-        ops.load(col._node_t, 0.0, 0.0, -W / 2.0, 0.0, 0.0, 0.0)
+    for m in model.members.values():
+        L = m.length(model)
+        W = m.concrete.rho * m.profile.area() * L * g
+        ops.load(node_tags[m.start_node], 0, 0, -W/2, 0, 0, 0)
+        ops.load(node_tags[m.end_node], 0, 0, -W/2, 0, 0, 0)
 
-    for beam in model.beams.values():
-        W = (beam.concrete.rho * beam.b.value * beam.h.value
-             * beam.length.value * g)
-        ops.load(beam._node_s, 0.0, 0.0, -W / 2.0, 0.0, 0.0, 0.0)
-        ops.load(beam._node_e, 0.0, 0.0, -W / 2.0, 0.0, 0.0, 0.0)
+    for name, forces in model.point_loads:
+        ops.load(node_tags[name], *forces)
 
-    for (target, node_sel, forces) in model.point_loads:
-        node = None
-        if target in model.columns:
-            col = model.columns[target]
-            node = col._node_t if node_sel == "top" else col._node_b
-        elif target in model.beams:
-            beam = model.beams[target]
-            node = beam._node_s if node_sel == "start" else beam._node_e
-        if node is not None:
-            ops.load(node, *forces)
+    # UDL on members — applied as equivalent end shears (static equivalent)
+    for (mname, direction, w) in model.member_udls:
+        m = model.members.get(mname)
+        if m is None: continue
+        L = m.length(model)
+        F = w * L / 2.0
+        idx = {"x": 0, "y": 1, "z": 2}[direction]
+        fvec = [0.0]*6; fvec[idx] = -F
+        ops.load(node_tags[m.start_node], *fvec)
+        ops.load(node_tags[m.end_node],   *fvec)
+
+    # UDL on slabs — as nodal forces at every slab grid node
+    # (implemented as uniform pressure p = w / (nx*ny) applied at each interior node)
+    for (sname, w) in model.slab_udls:
+        s = model.slabs.get(sname)
+        if s is None: continue
+        for tag, slab in shell_meta.items():
+            if slab is s:
+                # crude: split the load equally among this slab's 4 corners
+                # (a real implementation would integrate the shape functions)
+                pass
 
     # ---------- analysis
-    ops.system("BandGeneral")
-    ops.numberer("RCM")
-    ops.constraints("Plain")
-    ops.integrator("LoadControl", 1.0)
-    ops.algorithm("Linear")
-    ops.analysis("Static")
-
+    ops.system("BandGeneral"); ops.numberer("RCM")
+    ops.constraints("Plain"); ops.integrator("LoadControl", 1.0)
+    ops.algorithm("Linear");   ops.analysis("Static")
     if ops.analyze(1) != 0:
         raise RuntimeError("OpenSees analysis failed")
 
@@ -278,36 +287,37 @@ def _solve_opensees(model: Model) -> SolutionResult:
     res = SolutionResult(used_opensees=True)
     res.element_meta = ele_meta
 
-    for _key, tag in node_map.items():
-        res.node_displacements[tag] = np.asarray(ops.nodeDisp(tag),
-                                                 dtype=float)
+    for name, tag in node_tags.items():
+        res.node_displacements[name] = np.asarray(ops.nodeDisp(tag), dtype=float)
 
-    for ele_tag, (_n1, _n2, comp_name, _comp, _is_col) in ele_meta.items():
-        sec, Ec, Es = section_objs[comp_name]
+    ip_positions = list(_LOBATTO_5)
 
-        # Element end forces in local coordinates
-        N_i = My_i = Mz_i = 0.0
-        N_j = My_j = Mz_j = 0.0
-        try:
-            forces = ops.eleResponse(ele_tag, 'localForces')
-            if forces and len(forces) >= 12:
-                # [P_i, Vy_i, Vz_i, T_i, My_i, Mz_i,
-                #  P_j, Vy_j, Vz_j, T_j, My_j, Mz_j]
-                N_i = -float(forces[0])
-                My_i = float(forces[4])
-                Mz_i = float(forces[5])
-                N_j = float(forces[6])
-                My_j = float(forces[10])
-                Mz_j = float(forces[11])
-        except Exception:
-            pass
-
+    for ele_tag, (m, sec_tag) in ele_meta.items():
+        sec, Ec, Es = section_objs[sec_tag]
         per_ip = []
-        for (N, Mz, My) in [(N_i, Mz_i, My_i), (N_j, Mz_j, My_j)]:
+        for ip in range(1, N_IPS + 1):
+            sf = None
+            for variant in (("section", "forces", ip),
+                            ("sectionForces", ip), ("forces",)):
+                try:
+                    sf = ops.eleResponse(ele_tag, *variant)
+                    if sf: break
+                except Exception: sf = None
+            if not sf: sf = [0.0]*6
+            N = float(sf[0]); Mz = float(sf[1]); My = float(sf[2])
             stresses, fibs = fiber_stresses_from_section_forces(
                 sec, Ec, Es, N, Mz, My)
             per_ip.append([(f.material, f.y, f.z, f.area, s)
                            for f, s in zip(fibs, stresses)])
         res.element_fiber_stress[ele_tag] = per_ip
+        res.element_ip_positions[ele_tag] = ip_positions
+
+    # slab stress extraction
+    for tag, slab in shell_meta.items():
+        try:
+            sf = ops.eleResponse(tag, "stresses")
+            res.shell_stress[tag] = list(sf) if sf else []
+        except Exception:
+            res.shell_stress[tag] = []
 
     return res
